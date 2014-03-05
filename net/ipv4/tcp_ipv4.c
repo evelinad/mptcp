@@ -2008,12 +2008,13 @@ EXPORT_SYMBOL(tcp_prequeue);
 
 int tcp_v4_rcv(struct sk_buff *skb)
 {
+	//skb == socket buffer
 	const struct iphdr *iph;
 	const struct tcphdr *th;
 	struct sock *sk, *meta_sk = NULL;
 	int ret;
 	struct net *net = dev_net(skb->dev);
-
+	// daca nu e destinat statiei, il arunca
 	if (skb->pkt_type != PACKET_HOST)
 		goto discard_it;
 
@@ -2022,9 +2023,9 @@ int tcp_v4_rcv(struct sk_buff *skb)
 
 	if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
 		goto discard_it;
-
+	//extrage tcp header
 	th = tcp_hdr(skb);
-
+	//data offset == header dim
 	if (th->doff < sizeof(struct tcphdr) / 4)
 		goto bad_packet;
 	if (!pskb_may_pull(skb, th->doff * 4))
@@ -2036,9 +2037,12 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	 * So, we defer the checks. */
 	if (!skb_csum_unnecessary(skb) && tcp_v4_checksum_init(skb))
 		goto csum_error;
-
+	// why duplicate ? check line 2026
+	//extract tcp and ip headers
 	th = tcp_hdr(skb);
 	iph = ip_hdr(skb);
+	//don't know exactly what it does
+	//tcp_skb_cb == tcp soket buffer control block?
 	TCP_SKB_CB(skb)->seq = ntohl(th->seq);
 	TCP_SKB_CB(skb)->end_seq = (TCP_SKB_CB(skb)->seq + th->syn + th->fin +
 				    skb->len - th->doff * 4);
@@ -2050,14 +2054,16 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	TCP_SKB_CB(skb)->when	 = 0;
 	TCP_SKB_CB(skb)->ip_dsfield = ipv4_get_dsfield(iph);
 	TCP_SKB_CB(skb)->sacked	 = 0;
-
+	//search hashtable for the active socket
 	sk = __inet_lookup_skb(&tcp_hashinfo, skb, th->source, th->dest);
 
+	//2MSL wait after active close
 process:
 	if (sk && sk->sk_state == TCP_TIME_WAIT)
 		goto do_time_wait;
 
 #ifdef CONFIG_MPTCP
+	//new subflow
 	if (!sk && th->syn && !th->ack) {
 		int ret = mptcp_lookup_join(skb, NULL);
 

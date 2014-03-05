@@ -3223,12 +3223,16 @@ static void tcp_send_challenge_ack(struct sock *sk)
 	/* unprotected vars, we dont care of overwrites */
 	static u32 challenge_timestamp;
 	static unsigned int challenge_count;
+	//kernel unit time/ frequence
 	u32 now = jiffies / HZ;
 
 	if (now != challenge_timestamp) {
 		challenge_timestamp = now;
 		challenge_count = 0;
 	}
+	//The values for both the time and number of ACKs SHOULD be tunable
+     	// by the system administrator to accommodate different perceived
+      	//levels of threat and/or system resources.
 	if (++challenge_count <= sysctl_tcp_challenge_ack_limit) {
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPCHALLENGEACK);
 		tcp_send_ack(sk);
@@ -5047,12 +5051,13 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 	    tcp_paws_discard(sk, skb)) {
 		if (!th->rst) {
 			NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSESTABREJECTED);
+			//out of order segment, send duplicate ack
 			tcp_send_dupack(sk, skb);
 			goto discard;
 		}
 		/* Reset is accepted even if it did not pass PAWS. */
 	}
-
+	//ce face end_seq?
 	/* Step 1: check sequence number */
 	if (!tcp_sequence(tp, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq)) {
 		/* RFC793, page 37: "In all states except SYN-SENT, all reset
@@ -5157,7 +5162,7 @@ int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 	 */
 
 	tp->rx_opt.saw_tstamp = 0;
-
+	//mptcp always chooses slow path
 	/* MPTCP: force slowpath. */
 	if (tp->mpc)
 		goto slow_path;
@@ -5434,7 +5439,7 @@ static bool tcp_rcv_fastopen_synack(struct sock *sk, struct sk_buff *synack,
 	tp->syn_data_acked = tp->syn_data;
 	return false;
 }
-
+//checks for correct connection establishment
 static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 					 const struct tcphdr *th, unsigned int len)
 {
@@ -5701,7 +5706,7 @@ reset_and_undo:
  *	It's called from both tcp_v4_rcv and tcp_v6_rcv and should be
  *	address independent.
  */
-
+//connection management function; check tcp state machine
 int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 			  const struct tcphdr *th, unsigned int len)
 	__releases(&sk->sk_lock.slock)
@@ -5813,6 +5818,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 			tp->copied_seq = tp->rcv_nxt;
 		}
 		smp_mb();
+		//state change to established
 		tcp_set_state(sk, TCP_ESTABLISHED);
 		sk->sk_state_change(sk);
 
@@ -5884,7 +5890,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		}
 		if (tp->snd_una != tp->write_seq)
 			break;
-
+		//state change to tcp_fin_wait2
 		tcp_set_state(sk, TCP_FIN_WAIT2);
 		sk->sk_shutdown |= SEND_SHUTDOWN;
 

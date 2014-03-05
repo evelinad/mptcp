@@ -851,6 +851,7 @@ static int tcp_send_mss(struct sock *sk, int *size_goal, int flags)
 
 	if (tcp_sk(sk)->mpc) {
 		mss_now = mptcp_current_mss(sk);
+		//MSG_OOB == out of band data
 		*size_goal = mptcp_xmit_size_goal(sk, mss_now, !(flags & MSG_OOB));
 	} else {
 		mss_now = tcp_current_mss(sk);
@@ -1053,7 +1054,7 @@ static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *size)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int err, flags;
-
+	//is TFO supported?
 	if (!(sysctl_tcp_fastopen & TFO_CLIENT_ENABLE))
 		return -EOPNOTSUPP;
 	if (tp->fastopen_req != NULL)
@@ -1095,7 +1096,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 			goto out_err;
 		offset = copied_syn;
 	}
-
+	//0 if non blocking; else sk->timeo 
 	timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
 
 	/* Wait for a connection to finish. One exception is TCP Fast Open
@@ -1113,7 +1114,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		mptcp_for_each_sk(tp->mpcb, sk_it)
 			sock_rps_record_flow(sk_it);
 	}
-
+	//no idea
 	if (unlikely(tp->repair)) {
 		if (tp->repair_queue == TCP_RECV_QUEUE) {
 			copied = tcp_send_rcvq(sk, msg, size);
@@ -1133,6 +1134,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	mss_now = tcp_send_mss(sk, &size_goal, flags);
 
 	/* Ok commence sending. */
+	//no of user buffers + pointer to the user buffer
 	iovlen = msg->msg_iovlen;
 	iov = msg->msg_iov;
 	copied = 0;
@@ -1145,7 +1147,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		sg = mptcp_can_sg(sk);
 	else
 		sg = !!(sk->sk_route_caps & NETIF_F_SG);
-
+	//segmemtation implementation(1 loop-> buffer iter; 2loop->segm generation for each buffer)
 	while (--iovlen >= 0) {
 		size_t seglen = iov->iov_len;
 		unsigned char __user *from = iov->iov_base;
@@ -1164,25 +1166,30 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		while (seglen > 0) {
 			int copy = 0;
 			int max = size_goal;
-
+			//last elem from the socket		
 			skb = tcp_write_queue_tail(sk);
+			//check if there is any partial segment in the transmit queue
+			//a new segm is generated after the existing segment is fully loaded
 			if (tcp_send_head(sk)) {
 				if (skb->ip_summed == CHECKSUM_NONE)
 					max = mss_now;
 				copy = max - skb->len;
 			}
-
+			//transmit queue is not empty, check if the last segment in the queue is partial max(mss)> skb->len
 			if (copy <= 0) {
 new_segment:
 				/* Allocate new segment. If the interface is SG,
 				 * allocate skb fitting to single page.
 				 */
+                               //before allocating memory for a new segment, first check if the socket quota for the send buffer
+                                //has exceeded its limit
 				if (!sk_stream_memory_free(sk))
 					goto wait_for_sndbuf;
-
+				//if we have enough memory, allocate a new buffer for the tcp segment
 				skb = sk_stream_alloc_skb(sk,
 							  select_size(sk, sg),
 							  sk->sk_allocation);
+				//memory shortage, wait for memory to be available
 				if (!skb)
 					goto wait_for_memory;
 
@@ -1205,34 +1212,43 @@ new_segment:
 				if (((tp->mpc && !tp->mpcb->dss_csum) || !tp->mpc) &&
 				    (tp->mpc || sk->sk_route_caps & NETIF_F_ALL_CSUM))
 					skb->ip_summed = CHECKSUM_PARTIAL;
-
+				//queue the new segment
 				skb_entail(sk, skb);
 				copy = size_goal;
 				max = size_goal;
 			}
 
 			/* Try to append data to the end of skb. */
+			//if the space found to exist in the selected segment is smaller than teh data to be copied, make an adjustment
 			if (copy > seglen)
 				copy = seglen;
 
 			/* Where to copy to? */
+			//any space is available in the linear area of the selected buffer
+			//necessary for partial segments
 			if (skb_availroom(skb) > 0) {
 				/* We have some space in skb head. Superb! */
 				copy = min_t(int, copy, skb_availroom(skb));
+				//ready to copy data to the identified segment
 				err = skb_add_data_nocache(sk, skb, from, copy);
 				if (err)
 					goto do_fault;
 			} else {
 				bool merge = true;
+				//nr frags already allocated for the buffer
 				int i = skb_shinfo(skb)->nr_frags;
+				//current page and offset
 				struct page_frag *pfrag = sk_page_frag(sk);
 
 				if (!sk_page_frag_refill(sk, pfrag))
 					goto wait_for_memory;
-
+				//data can be added to the existing partially filled page for the paged area
 				if (!skb_can_coalesce(skb, i, pfrag->page,
 						      pfrag->offset)) {
+					// no of pages allocated exceeds the limit for the buffer/not scatter-gather capable hrdwr
+					//allocate a new tcp segment
 					if (i == MAX_SKB_FRAGS || !sg) {
+						//mark that new data can be merged to the last modified page
 						tcp_mark_push(tp, skb);
 						goto new_segment;
 					}
@@ -1264,23 +1280,34 @@ new_segment:
 
 			if (!copied)
 				TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_PSH;
-
+			//update write seq with amount of data added to the write queue
 			tp->write_seq += copy;
+			//update end seq no
 			TCP_SKB_CB(skb)->end_seq += copy;
 			skb_shinfo(skb)->gso_segs = 0;
+                        //shift user buffer pointer to point to the location where we need to start copying next
 
 			from += copy;
+			//update no bytes copied
 			copied += copy;
+			//if we have copied the entire data from the user buffer, tru to send out the segment queued 
+			//in the transmit queue, try to send out the segment queued in the transmit queue
 			if ((seglen -= copy) == 0 && iovlen == 0)
 				goto out;
-
+			//if we have not copied the entire user buffer to the socket buffer
+			//check if the segment we are working on is still partial/we are snding an OOB message
+			//if true, iterate again
 			if (skb->len < max || (flags & MSG_OOB) || unlikely(tp->repair))
 				continue;
-
+			//full sized segment, check if we need to force a push flag on the last segment in the transmit queue
 			if (forced_push(tp)) {
+				//if there is a need to tell the receiver to push data to the application as earlier as possible
+				//mark the push seq no as a write seq no 
 				tcp_mark_push(tp, skb);
+				//start transmitting pending frames, in case we satisfy Nagle alg , cong window for sender & receiver
 				__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
 			} else if (skb == tcp_send_head(sk))
+				//only one segment in the transmit queue, push the segment in the transmit queue
 				tcp_push_one(sk, mss_now);
 			continue;
 
@@ -1301,6 +1328,7 @@ out:
 	if (copied)
 		tcp_push(sk, flags, mss_now, tp->nonagle);
 	release_sock(sk);
+	//copy no of bytes
 	return copied + copied_syn;
 
 do_fault:

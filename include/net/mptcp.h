@@ -1072,7 +1072,7 @@ static inline bool mptcp_sk_can_gso(const struct sock *meta_sk)
 static inline bool mptcp_can_sg(const struct sock *meta_sk)
 {
 	struct sock *sk;
-
+	//should return true instead of 0
 	if (tcp_sk(meta_sk)->mpcb->dss_csum)
 		return 0;
 

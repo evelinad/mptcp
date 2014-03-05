@@ -1062,7 +1062,7 @@ int mptcp_check_req(struct sk_buff *skb, struct net *net)
 	/* MPTCP structures not initialized */
 	if (mptcp_init_failed)
 		return 0;
-
+	// meta socket holds the multipath control block; acts as the connection  level socket
 	if (skb->protocol == htons(ETH_P_IP))
 		meta_sk = mptcp_v4_search_req(th->source, ip_hdr(skb)->saddr,
 					      ip_hdr(skb)->daddr, net);
@@ -1076,10 +1076,25 @@ int mptcp_check_req(struct sk_buff *skb, struct net *net)
 		return 0;
 
 	TCP_SKB_CB(skb)->mptcp_flags = MPTCPHDR_JOIN;
-
+/* Used by processes to "lock" a socket state, so that
+ * interrupts and bottom half handlers won't change it
+ * from under us. It essentially blocks any incoming
+ * packets, so that we won't get any new data or any
+ * packets that change the state of the socket.
+ *
+ * While locked, BH processing will add new packets to
+ * the backlog queue.  This queue is processed by the
+ * owner of the socket lock right before it is released.
+ *
+	
+*/
 	bh_lock_sock_nested(meta_sk);
+	//checks if user owns socket ((sk)->sk_lock.owned)
 	if (sock_owned_by_user(meta_sk)) {
 		skb->sk = meta_sk;
+		//likely/unlikely 
+		//instruction to the compiler to emit instructions that will cause branch prediction to favour the "likely" side of a jump instruction
+		//backlog looks like a linked list
 		if (unlikely(sk_add_backlog(meta_sk, skb,
 					    meta_sk->sk_rcvbuf + meta_sk->sk_sndbuf))) {
 			bh_unlock_sock(meta_sk);
@@ -1096,6 +1111,7 @@ int mptcp_check_req(struct sk_buff *skb, struct net *net)
 #endif /* CONFIG_IPV6 */
 	}
 	bh_unlock_sock(meta_sk);
+	/* Ungrab socket and destroy it, if it was the last reference. */
 	sock_put(meta_sk); /* Taken by mptcp_vX_search_req */
 	return 1;
 }
