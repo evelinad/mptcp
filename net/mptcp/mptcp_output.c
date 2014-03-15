@@ -71,7 +71,7 @@ static int mptcp_is_available(struct sock *sk, struct sk_buff *skb,
 	 */
 	if (tp->mptcp->pre_established)
 		return 0;
-
+	//pf == potentially failed 
 	if (tp->pf ||
 	    (tp->mpcb->noneligible & mptcp_pi_to_flag(tp->mptcp->path_index)))
 		return 0;
@@ -151,7 +151,8 @@ static struct sock *get_available_subflow(struct sock *meta_sk,
 			bestsk = NULL;
 		return bestsk;
 	}
-
+	
+	//daca primeste un DATA_FIN, trebuie sa raspunda pe acelasi subflow pe care l-a primit
 	/* Answer data_fin on same subflow!!! */
 	if (meta_sk->sk_shutdown & RCV_SHUTDOWN &&
 	    skb && mptcp_is_data_fin(skb)) {
