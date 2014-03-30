@@ -1147,6 +1147,9 @@ retry:
 			if (diff)
 				tcp_adjust_pcount(meta_sk, skb, diff);
 		}
+		//the kernel judges whether the number of outstanding segments, 
+		//including normal and retransmitted segments,
+		//is more than the current network capacity (cwnd)
 
 		cwnd_quota = tcp_cwnd_test(subtp, skb);
 		if (!cwnd_quota) {
@@ -1161,9 +1164,13 @@ retry:
 			 *   tso_segs to something > 1. Then, cwnd_test might
 			 *   reject it.
 			 */
+			//current window is full
+			// Path mask of temporarily noneligible subflows by the scheduler
 			mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
 			continue;
 		}
+		//he kernel determines whether the latest sent segment has exceeded the limit of the receiver’s buffer
+
 
 		if (!reinject && unlikely(!tcp_snd_wnd_test(meta_tp, skb, mss_now))) {
 			skb = mptcp_rcv_buf_optimization(subsk, 1);
