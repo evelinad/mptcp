@@ -44,6 +44,7 @@
 #include <asm/unaligned.h>
 #include <crypto/hash.h>
 #include <net/tcp.h>
+#include <linux/list.h>
 
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 	#define ntohll(x)  be64_to_cpu(x)
@@ -58,6 +59,14 @@
 #define MPTCP_MAX_ADDR	8
 
 #define MPTCP_SUBFLOW_RETRY_DELAY	1000
+
+struct mptcp_subflow
+{
+	struct sock *sk;
+	unsigned int *mss;
+	struct list_head list;
+
+};
 
 struct mptcp_loc4 {
 	u8		id;

@@ -128,6 +128,97 @@ static int mptcp_dont_reinject_skb(struct tcp_sock *tp, struct sk_buff *skb)
 		mptcp_pi_to_flag(tp->mptcp->path_index) & TCP_SKB_CB(skb)->path_mask;
 }
 
+static struct mptcp_subflow * mptcp_subflow_alloc(struct sock *sk, unsigned int * mss)
+{
+	struct mptcp_subflow *sf;
+	sf = kmalloc(sizeof(*sf), GFP_KERNEL);
+	if(!sf)
+		return NULL;
+	sf->mss = mss;
+	sf->sk = sk;
+	return sf;
+}
+
+static void mptcp_subflow_remove_all(struct list_head *subflows)
+{
+	struct list_head *p, *q;
+        struct mptcp_subflow *sf;
+	list_for_each_safe(p, q, subflows) {
+		sf = list_entry(p, struct mptcp_subflow, list);
+		list_del(p);
+		kfree(sf);
+	}	
+}
+
+static int get_all_available_subflows(struct list_head *subflows, struct sock *meta_sk, struct sk_buff *skb, bool wndtest)
+{
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct list_head lowpriosk_list;
+	struct list_head sk_list;
+	struct list_head backupsk_list;
+	unsigned int *mss = 0;
+	int err = 0;
+	struct mptcp_subflow *sf;
+
+	INIT_LIST_HEAD(&lowpriosk_list);
+	INIT_LIST_HEAD(&sk_list);
+	INIT_LIST_HEAD(&backupsk_list);
+
+	if (meta_sk->sk_shutdown & RCV_SHUTDOWN &&
+	    skb && mptcp_is_data_fin(skb)) {
+		mptcp_for_each_sk(mpcb, sk) {
+			if (tcp_sk(sk)->mptcp->path_index == mpcb->dfin_path_index &&
+			    mptcp_is_available(sk, skb, mss, wndtest))
+				sf = mptcp_subflow_alloc(sk, mss);
+				list_add((&sf->list, subflows);
+				goto out;
+		}
+	}
+
+	mptcp_for_each_sk(mpcb, sk) {
+		struct tcp_sock *tp = tcp_sk(sk);
+		if (!mptcp_is_available(sk, skb, mss, wndtest))
+                        continue;
+                sf = mptcp_subflow_alloc(sk, mss);
+                if (mptcp_dont_reinject_skb(tp, skb)) {
+                        list_add((&sf->list, &backupsk_list);
+                        continue;
+                }
+
+		if (tp->mptcp->rcv_low_prio || tp->mptcp->low_prio)
+		{
+                        list_add((&sf->list, &lowpriosk_list);
+		}
+		else
+                        list_add((&sf->list, &sk_list);
+
+
+	}
+	
+	if(!list_empty(&sk_list)) {
+		subflows = &sk_list;
+		mptcp_remove_all(&backupsk_list);
+		mptcp_remove_all(&lowpriosk_list);
+		goto out;
+	}
+	if(!list_empty(&backupsk_list))
+	{
+		subflows = &backupsk_list;
+                mptcp_remove_all(&sk_list);
+                mptcp_remove_all(&lowpriosk_list);		
+		goto out;
+	}
+	if(!list_empty(&lowpriosk_list))
+	{
+		subflows = &lowpriosk_list;
+                mptcp_remove_all(&backupsk_list);
+                mptcp_remove_all(&sk_list);
+		goto out;
+	}
+	out:
+		return err;
+	
+}
 /* This is the scheduler. This function decides on which flow to send
  * a given MSS. If all subflows are found to be busy, NULL is returned
  * The flow is selected based on the shortest RTT.
