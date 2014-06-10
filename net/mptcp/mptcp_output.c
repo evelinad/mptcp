@@ -182,7 +182,7 @@ static struct sock *get_available_subflow(struct sock *meta_sk,
 				backupsk = sk;
 				continue;
 			}
-
+			//daca toate  sk-urile sunt de backup(au low_prio) sa il aleaga pe cel mai  cu low_prio mai mic
 			lowprio_min_time_to_peer = tp->srtt;
 			lowpriosk = sk;
 			mss_lowprio = this_mss;
