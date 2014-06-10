@@ -167,7 +167,7 @@ static struct sock *get_available_subflow(struct sock *meta_sk,
 	mptcp_for_each_sk(mpcb, sk) {
 		struct tcp_sock *tp = tcp_sk(sk);
 		int this_mss;
-
+		// ca sa verifice daca toate sunt au primit sau nu MP_PRIO, prioritate mica
 		if (tp->mptcp->rcv_low_prio || tp->mptcp->low_prio)
 			cnt_backups++;
 
