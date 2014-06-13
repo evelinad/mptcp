@@ -1171,6 +1171,7 @@ retry:
 		}
 		//he kernel determines whether the latest sent segment has exceeded the limit of the receiver’s buffer
 
+		test_snd_wnd_test => /* Does at least the first segment of SKB fit into the send window? */
 
 		if (!reinject && unlikely(!tcp_snd_wnd_test(meta_tp, skb, mss_now))) {
 			skb = mptcp_rcv_buf_optimization(subsk, 1);
