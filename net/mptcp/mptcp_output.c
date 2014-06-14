@@ -131,9 +131,10 @@ static int mptcp_dont_reinject_skb(struct tcp_sock *tp, struct sk_buff *skb)
 static struct mptcp_subflow * mptcp_subflow_alloc(struct sock *sk, unsigned int * mss)
 {
 	struct mptcp_subflow *sf;
-	sf = kmalloc(sizeof(*sf), GFP_KERNEL);
+	sf = kmalloc(sizeof(*sf), GFP_ATOMIC);
 	if(!sf)
 		return NULL;
+	INIT_LIST_HEAD(&sf->list);
 	sf->mss = mss;
 	sf->sk = sk;
 	return sf;
@@ -1249,7 +1250,8 @@ subflow:
 			mptcp_subflow_remove_all(&subflows);
 
 		if(tcp_skb_is_last(meta_sk,skb)) {
-			get_all_available_subflows(&subflows, meta_sk, skb, true);
+			if(get_all_available_subflows(&subflows, meta_sk, skb, true)!=0)
+				goto exit;
 			if(list_empty(&subflows))
 				goto exit;
 		}
@@ -2083,7 +2085,8 @@ int mptcp_retransmit_skb(struct sock *meta_sk, struct sk_buff *skb)
 	/* We need to make sure that the retransmitted segment can be sent on a
 	 * subflow right now. If it is too big, it needs to be fragmented.
 	 */
-	get_all_available_subflows(&subflows, meta_sk, skb, true);
+	if(get_all_available_subflows(&subflows, meta_sk, skb, true)!=0)
+		goto failed;
 	if(list_empty(&subflows)) {
 		/* We want to increase icsk_retransmits, thus return 0, so that
                  * mptcp_retransmit_timer enters the desired branch.
