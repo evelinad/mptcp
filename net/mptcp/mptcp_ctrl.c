@@ -64,8 +64,11 @@ static struct kmem_cache *mptcp_tw_cache __read_mostly;
 int sysctl_mptcp_enabled __read_mostly = 1;
 int sysctl_mptcp_checksum __read_mostly = 1;
 int sysctl_mptcp_debug __read_mostly;
+
 EXPORT_SYMBOL(sysctl_mptcp_debug);
 int sysctl_mptcp_syn_retries __read_mostly = 3;
+int sysctl_mptcp_optimize_transmit __read_mostly = 1;
+int sysctl_mptcp_optimize_retransmit __read_mostly = 1;
 
 bool mptcp_init_failed __read_mostly;
 
@@ -123,7 +126,22 @@ static struct ctl_table mptcp_table[] = {
 		.maxlen		= MPTCP_PM_NAME_MAX,
 		.proc_handler	= proc_mptcp_path_manager,
 	},
-	{ }
+	{
+		.procname = "mptcp_optimize_transmit",
+		.data = &sysctl_mptcp_optimize_transmit,
+		.maxlen = sizeof(int),
+		.mode = 0644,
+		.proc_handler = &proc_dointvec
+	},
+        {
+                .procname = "mptcp_optimize_retransmit",
+                .data = &sysctl_mptcp_optimize_retransmit,
+                .maxlen = sizeof(int),
+                .mode = 0644,
+                .proc_handler = &proc_dointvec
+        },
+
+       { }
 };
 
 static inline u32 mptcp_hash_tk(u32 token)

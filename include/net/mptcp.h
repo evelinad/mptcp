@@ -637,6 +637,8 @@ extern int sysctl_mptcp_enabled;
 extern int sysctl_mptcp_checksum;
 extern int sysctl_mptcp_debug;
 extern int sysctl_mptcp_syn_retries;
+extern int sysctl_mptcp_optimize_transmit;
+extern int sysctl_mptcp_optimize_retransmit;
 
 extern struct workqueue_struct *mptcp_wq;
 
