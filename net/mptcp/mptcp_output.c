@@ -127,6 +127,30 @@ static int mptcp_dont_reinject_skb(struct tcp_sock *tp, struct sk_buff *skb)
 		mptcp_pi_to_flag(tp->mptcp->path_index) & TCP_SKB_CB(skb)->path_mask;
 }
 
+
+static struct mptcp_subflow * mptcp_subflow_alloc(struct sock *sk, unsigned int * mss)
+{
+	struct mptcp_subflow *sf;
+	sf = kmalloc(sizeof(*sf), GFP_ATOMIC);
+	if(!sf)
+		return NULL;
+	INIT_LIST_HEAD(&sf->list);
+	sf->mss = mss;
+	sf->sk = sk;
+	return sf;
+}
+
+static void mptcp_subflow_remove_all(struct list_head *subflows)
+{
+	struct list_head *p, *q;
+        struct mptcp_subflow *sf;
+	list_for_each_safe(p, q, subflows) {
+		sf = list_entry(p, struct mptcp_subflow, list);
+		list_del(p);
+		kfree(sf);
+	}	
+}
+
 /* This is the scheduler. This function decides on which flow to send
  * a given MSS. If all subflows are found to be busy, NULL is returned
  * The flow is selected based on the shortest RTT.
@@ -221,6 +245,125 @@ static struct sock *get_available_subflow(struct sock *meta_sk,
 		*mss_now = mss;
 
 	return sk;
+}
+
+
+static int get_all_available_subflows(struct list_head *subflows, struct sock *meta_sk,
+			struct sk_buff *skb, unsigned int *mss_now)
+{
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct sock *sk;
+	int err = 0;
+	struct list_head lowpriosk_list;
+	struct list_head sk_list;
+	struct list_head backupsk_list;
+	struct mptcp_subflow *sf = NULL;
+	struct tcp_skb_cb *tcb = NULL;
+	INIT_LIST_HEAD(&lowpriosk_list);
+	INIT_LIST_HEAD(&sk_list);
+	INIT_LIST_HEAD(&backupsk_list);
+
+	if(!skb)
+		goto out;
+
+	tcb = TCP_SKB_CB(skb);
+
+
+	if (tcb->tcp_flags & TCPHDR_SYN) {
+		sk = get_available_subflow(meta_sk, skb, mss_now);
+		if(!sk) {
+			err = -EAGAIN;
+			goto out;
+		}
+
+		sf = mptcp_subflow_alloc(sk, mss_now);
+                if(sf == NULL) {
+                	err = -ENOMEM;
+                        goto out;
+                }
+                list_add(&sf->list, subflows);
+                goto out;
+	}
+
+	if (meta_sk->sk_shutdown & RCV_SHUTDOWN &&
+	    skb && mptcp_is_data_fin(skb)) {
+		mptcp_for_each_sk(mpcb, sk) {
+			if (tcp_sk(sk)->mptcp->path_index == mpcb->dfin_path_index &&
+			    mptcp_is_available(sk, skb, mss_now))
+				sf = mptcp_subflow_alloc(sk, mss_now);
+				if(sf == NULL) {
+					err = -ENOMEM;
+					goto out;
+				}
+				list_add(&sf->list, subflows);
+				goto out;
+		}
+	}
+
+	mptcp_for_each_sk(mpcb, sk) {
+		struct tcp_sock *tp = tcp_sk(sk);
+	        unsigned int *mss = 0;
+		if (!mptcp_is_available(sk, skb, mss))
+		{
+			//printk(KERN_ALERT "unavailable\n");
+                        continue;
+		}
+		//else printk(KERN_ALERT "edebine\n");
+                sf = mptcp_subflow_alloc(sk, mss);
+		if(sf == NULL) {
+                        err = -ENOMEM;
+			//printk(KERN_ALERT "naspa\n");
+			continue;
+		}
+                if (mptcp_dont_reinject_skb(tp, skb)) {
+                        list_add(&sf->list, &backupsk_list);
+                } 
+		else 
+		if (tp->mptcp->rcv_low_prio || tp->mptcp->low_prio) {
+                        list_add(&sf->list, &lowpriosk_list);
+		}
+		else
+                        list_add(&sf->list, &sk_list);
+
+
+	}
+        //printk(KERN_ALERT "empty %d %d %d\n", list_empty(&sk_list),list_empty(&backupsk_list),list_empty(&lowpriosk_list));
+
+	if(!list_empty(&sk_list)) {
+		subflows = &sk_list;
+		mptcp_subflow_remove_all(&backupsk_list);
+		mptcp_subflow_remove_all(&lowpriosk_list);
+		goto out;
+	}
+	if(!list_empty(&backupsk_list))
+	{
+		subflows = &backupsk_list;
+		if (skb)
+			TCP_SKB_CB(skb)->path_mask = 0;
+                mptcp_subflow_remove_all(&sk_list);
+                mptcp_subflow_remove_all(&lowpriosk_list);
+		goto out;
+	}
+	if(!list_empty(&lowpriosk_list))
+	{
+		subflows = &lowpriosk_list;
+                mptcp_subflow_remove_all(&backupsk_list);
+                mptcp_subflow_remove_all(&sk_list);
+		goto out;
+	}
+	out:
+		/*if(err != 0) {
+		        if(!list_empty(&lowpriosk_list))
+                		mptcp_subflow_remove_all(&lowpriosk_list);
+			if(!list_empty(&sk_list)) 
+                                mptcp_subflow_remove_all(&sk_list);
+			if(!list_empty(&backupsk_list)) 
+                        	mptcp_subflow_remove_all(&backupsk_list);
+
+		}*/
+		//printk(KERN_ALERT "empty %d\n", list_empty(subflows));
+		return err;
+
 }
 
 static struct mp_dss *mptcp_skb_find_dss(const struct sk_buff *skb)
@@ -1007,7 +1150,7 @@ static struct sk_buff *mptcp_rcv_buf_optimization(struct sock *sk, int penal)
 	struct tcp_sock *tp = tcp_sk(sk), *tp_it;
 	struct sk_buff *skb_head;
 
-	if (tp->mpcb->cnt_subflows == 1)
+	if (!sysctl_mptcp_rbuf_opti || tp->mpcb->cnt_subflows == 1)
 		return NULL;
 
 	meta_sk = mptcp_meta_sk(sk);
@@ -1022,6 +1165,9 @@ static struct sk_buff *mptcp_rcv_buf_optimization(struct sock *sk, int penal)
 	 * we wake up the application.
 	 */
 	if (!penal && sk_stream_memory_free(meta_sk))
+		goto retrans;
+
+	if (!sysctl_mptcp_rbuf_penal)
 		goto retrans;
 
 	/* Only penalize again after an RTT has elapsed */
@@ -1044,6 +1190,8 @@ static struct sk_buff *mptcp_rcv_buf_optimization(struct sock *sk, int penal)
 	}
 
 retrans:
+   if (!sysctl_mptcp_rbuf_retr)
+       return NULL;
 
 	/* Segment not yet injected into this path? Take it!!! */
 	if (!(TCP_SKB_CB(skb_head)->path_mask & mptcp_pi_to_flag(tp->mptcp->path_index))) {
@@ -1071,9 +1219,236 @@ retrans:
 	return NULL;
 }
 
+
+int mptcp_opportunistic_retransmit_unacked2(struct sock *meta_sk,
+			unsigned int mss_now, int nonagle, gfp_t gfp, int stop_seq)
+{
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *subtp;
+        struct mptcp_cb *mpcb = meta_tp->mpcb;
+	struct sock *subsk;
+	struct sk_buff *skb;
+	unsigned int tso_segs,  sent_pkts;
+	unsigned int limit;
+	struct sk_buff *subskb = NULL;
+	int cwnd_quota;
+        //struct list_head subflows;
+        //struct list_head *p;
+        //struct mptcp_subflow *sf = NULL;
+	u32 noneligible;
+
+	sent_pkts = 0;
+
+	skb = tcp_write_queue_head(meta_sk);
+
+
+	while(1) {
+	noneligible = mpcb->noneligible;
+	if(!skb)
+		break;
+
+	if(TCP_SKB_CB(skb)->seq >= stop_seq)
+		break;
+
+  subsk = get_available_subflow(meta_sk, skb, &mss_now);
+  
+  if(!subsk)
+		 break;
+
+
+	//if(!before(meta_tp->snd_una, TCP_SKB_CB(skb)->end_seq))
+	//	goto exit;
+	if(TCP_SKB_CB(skb)->path_mask == 0)
+		goto exit;
+
+
+	subtp = tcp_sk(subsk);
+
+	if (mptcp_dont_reinject_skb(subtp, skb))
+		goto exit;
+
+	if (skb_unclone(skb, GFP_ATOMIC))
+		goto exit;
+
+	tcp_set_skb_tso_segs(meta_sk, skb, mss_now);
+	tso_segs = tcp_skb_pcount(skb);
+	cwnd_quota = tcp_cwnd_test(subtp, skb);
+	if (!cwnd_quota) {
+		mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+		goto exit;
+	}
+
+	if(!tcp_snd_wnd_test(meta_tp, skb, mss_now))
+		goto exit;
+
+	if (tso_segs == 1) {
+		if (unlikely(!tcp_nagle_test(meta_tp, skb, mss_now,
+			     (tcp_skb_is_last(meta_sk, skb) ?
+			      nonagle : TCP_NAGLE_PUSH))))
+			goto exit;
+		} else {
+			if (tcp_tso_should_defer(subsk, skb)) {
+				mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+				goto exit;
+			}
+		}	
+	limit = mss_now;
+	if (tso_segs > 1 && !tcp_urg_mode(meta_tp))
+		limit = tcp_mss_split_point(subsk, skb, mss_now,
+			min_t(unsigned int,
+				cwnd_quota,
+				subsk->sk_gso_max_segs),nonagle);
+
+	/*should be -1, the same as mptcp_rcv_buf_optimization*/
+	if (skb->len > limit &&
+	    unlikely(mptso_fragment(meta_sk, skb, limit, mss_now, gfp, -1)))
+			goto exit;
+
+	subskb = mptcp_skb_entail(subsk, skb, -1);
+	if (!subskb)
+		goto exit;
+
+	TCP_SKB_CB(skb)->when = tcp_time_stamp;
+	TCP_SKB_CB(subskb)->when = tcp_time_stamp;
+
+	if (unlikely(tcp_transmit_skb(subsk, subskb, 1, gfp))) {
+		mptcp_transmit_skb_failed(subsk, skb, subskb);
+		mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+		goto exit;
+	}
+
+
+	tcp_minshall_update(meta_tp, mss_now, skb);
+	sent_pkts += tcp_skb_pcount(skb);
+	tcp_sk(subsk)->mptcp->sent_pkts += tcp_skb_pcount(skb);
+
+	mptcp_sub_event_new_data_sent(subsk, subskb, skb);
+
+exit:
+	if(!skb_queue_is_last(&meta_sk->sk_write_queue, skb))
+		skb = tcp_write_queue_next(meta_sk, skb);
+	else break;
+
+	mpcb->noneligible=noneligible;
+
+}
+
+
+	return sent_pkts;
+}
+
+
+int mptcp_opportunistic_retransmit_unacked(struct sock *meta_sk,
+			unsigned int mss_now, int nonagle, gfp_t gfp, int stop_seq)
+{
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *subtp;
+        struct mptcp_cb *mpcb = meta_tp->mpcb;
+	struct sock *subsk;
+	struct sk_buff *skb;
+	unsigned int tso_segs,  sent_pkts;
+	unsigned int limit;
+	struct sk_buff *subskb = NULL;
+	int cwnd_quota;
+        //struct list_head subflows;
+        //struct list_head *p;
+        //struct mptcp_subflow *sf = NULL;
+	u32 noneligible = mpcb->noneligible;
+
+	sent_pkts = 0;
+
+	skb = tcp_write_queue_head(meta_sk);
+	if(!skb)
+		goto exit;
+
+
+	if(TCP_SKB_CB(skb)->seq >= stop_seq)
+		goto exit;
+
+        subsk = get_available_subflow(meta_sk, skb, &mss_now);
+        if(!subsk) {
+		 goto exit;
+	}
+
+	//if(!before(meta_tp->snd_una, TCP_SKB_CB(skb)->end_seq))
+	//	goto exit;
+	if(TCP_SKB_CB(skb)->path_mask == 0)
+		goto exit;
+
+
+	subtp = tcp_sk(subsk);
+
+	if (mptcp_dont_reinject_skb(subtp, skb))
+		goto exit;
+
+	if (skb_unclone(skb, GFP_ATOMIC))
+		goto exit;
+
+	tcp_set_skb_tso_segs(meta_sk, skb, mss_now);
+	tso_segs = tcp_skb_pcount(skb);
+	cwnd_quota = tcp_cwnd_test(subtp, skb);
+	if (!cwnd_quota) {
+		mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+		goto exit;
+	}
+
+	if(!tcp_snd_wnd_test(meta_tp, skb, mss_now))
+		goto exit;
+
+	if (tso_segs == 1) {
+		if (unlikely(!tcp_nagle_test(meta_tp, skb, mss_now,
+			     (tcp_skb_is_last(meta_sk, skb) ?
+			      nonagle : TCP_NAGLE_PUSH))))
+			goto exit;
+		} else {
+			if (tcp_tso_should_defer(subsk, skb)) {
+				mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+				goto exit;
+			}
+		}	
+	limit = mss_now;
+	if (tso_segs > 1 && !tcp_urg_mode(meta_tp))
+		limit = tcp_mss_split_point(subsk, skb, mss_now,
+			min_t(unsigned int,
+				cwnd_quota,
+				subsk->sk_gso_max_segs),nonagle);
+
+	/*should be -1, the same as mptcp_rcv_buf_optimization*/
+	if (skb->len > limit &&
+	    unlikely(mptso_fragment(meta_sk, skb, limit, mss_now, gfp, -1)))
+			goto exit;
+
+	subskb = mptcp_skb_entail(subsk, skb, -1);
+	if (!subskb)
+		goto exit;
+
+	TCP_SKB_CB(skb)->when = tcp_time_stamp;
+	TCP_SKB_CB(subskb)->when = tcp_time_stamp;
+
+	if (unlikely(tcp_transmit_skb(subsk, subskb, 1, gfp))) {
+		mptcp_transmit_skb_failed(subsk, skb, subskb);
+		mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+		goto exit;
+	}
+
+
+	tcp_minshall_update(meta_tp, mss_now, skb);
+	sent_pkts += tcp_skb_pcount(skb);
+	tcp_sk(subsk)->mptcp->sent_pkts += tcp_skb_pcount(skb);
+
+	mptcp_sub_event_new_data_sent(subsk, subskb, skb);
+
+
+
+exit:	
+	mpcb->noneligible=noneligible;
+
+//	printk(KERN_ALERT "gata!\n");
+	return sent_pkts;
+}
+
 int mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
 		     int push_one, gfp_t gfp)
 {
+
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *subtp;
 	struct sock *subsk;
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
@@ -1082,7 +1457,12 @@ int mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
 	int cwnd_quota;
 	int result;
 	int reinject = 0;
+	struct mptcp_subflow *sf = NULL;
+	struct list_head *p;
+	int stop_seq;
+	struct list_head subflows;
 
+	INIT_LIST_HEAD(&subflows);
 	sent_pkts = 0;
 
 	/* Currently mtu-probing is not done in MPTCP */
@@ -1095,11 +1475,13 @@ int mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
 			sent_pkts = 1;
 	}
 
+	stop_seq = meta_tp->write_seq;
+
 	while ((skb = mptcp_next_segment(meta_sk, &reinject))) {
 		unsigned int limit;
 		struct sk_buff *subskb = NULL;
 		u32 noneligible = mpcb->noneligible;
-
+		bool sent_once = false;
 		if (reinject == 1) {
 			if (!after(TCP_SKB_CB(skb)->end_seq, meta_tp->snd_una)) {
 				/* Segment already reached the peer, take the next one */
@@ -1117,129 +1499,195 @@ int mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
 		}
 
 subflow:
-		subsk = get_available_subflow(meta_sk, skb, &mss_now);
-		if (!subsk)
-			break;
-		subtp = tcp_sk(subsk);
+		if(!list_empty(&subflows))
+			mptcp_subflow_remove_all(&subflows);
 
-		/* Since all subsocks are locked before calling the scheduler,
-		 * the tcp_send_head should not change.
-		 */
-		BUG_ON(!reinject && tcp_send_head(meta_sk) != skb);
-retry:
-		/* If the segment was cloned (e.g. a meta retransmission),
-		 * the header must be expanded/copied so that there is no
-		 * corruption of TSO information.
-		 */
-		if (skb_unclone(skb, GFP_ATOMIC))
-			break;
+		if(tcp_skb_is_last(meta_sk,skb) && sysctl_mptcp_optimize_transmit) {
+			get_all_available_subflows(&subflows, meta_sk, skb, &mss_now);
+			if(list_empty(&subflows))
+				goto exit;
+			/*{
+				printk(KERN_ALERT "de aici\n");
+				goto exit;
+			}*/
+			//printk(KERN_ALERT "empty2%d\n", list_empty(&subflows));
+			/*if(list_empty(&subflows)) {
+				//printk(KERN_ALERT "sau de aici\n");
+				subsk = get_available_subflow(meta_sk, skb, &mss_now);
+		                if(!subsk)
+				{
+					//printk(KERN_ALERT "e de oaie\n");
+                	                goto exit;
+				}
+                        	sf = mptcp_subflow_alloc(subsk, &mss_now);
+				if(sf == NULL) {
+		                        //printk(KERN_ALERT "nomem\n");
+                		        goto exit;
+                		}
 
-		old_factor = tcp_skb_pcount(skb);
-		tcp_set_skb_tso_segs(meta_sk, skb, mss_now);
-		tso_segs = tcp_skb_pcount(skb);
-
-		if (reinject == -1) {
-			/* The packet has already once been sent, so if we
-			 * change the pcount here we have to adjust packets_out
-			 * in the meta-sk
-			 */
-			int diff = old_factor - tso_segs;
-
-			if (diff)
-				tcp_adjust_pcount(meta_sk, skb, diff);
+	                        list_add(&sf->list, &subflows);
+				//printk(KERN_ALERT "ba, totusi e ok\n");
+				//goto exit;
+			}*/
+			//else printk(KERN_ALERT "mama\n");
 		}
+		else {
+	                subsk = get_available_subflow(meta_sk, skb, &mss_now);
+			if(!subsk)
+				goto exit;
+			sf = mptcp_subflow_alloc(subsk, &mss_now);
+                        list_add(&sf->list, &subflows);
 
-		cwnd_quota = tcp_cwnd_test(subtp, skb);
-		if (!cwnd_quota) {
-			/* May happen due to two cases:
-			 *
-			 * - if at the first selection we circumvented
-			 *   the test due to a DATA_FIN (and got rejected at
-			 *   tcp_snd_wnd_test), but the reinjected segment is not
-			 *   a DATA_FIN.
-			 * - if we take a DATA_FIN with data, but
-			 *   tcp_set_skb_tso_segs() increases the number of
-			 *   tso_segs to something > 1. Then, cwnd_test might
-			 *   reject it.
-			 */
-			mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
-			continue;
 		}
+		//printk(KERN_ALERT "gogu\n");
+   		/* Since all subsocks are locked before calling the scheduler,
+                 * the tcp_send_head should not change.
+                 */
 
-		if (!reinject && unlikely(!tcp_snd_wnd_test(meta_tp, skb, mss_now))) {
-			skb = mptcp_rcv_buf_optimization(subsk, 1);
-			if (skb) {
-				reinject = -1;
-				goto retry;
+                BUG_ON(!reinject && tcp_send_head(meta_sk) != skb);
+
+        	list_for_each(p, &subflows) {
+                	sf = list_entry(p, struct mptcp_subflow, list);
+			subsk = sf->sk;
+			subtp = tcp_sk(subsk);
+			mss_now = *(sf->mss);
+			//printk(KERN_ALERT "list\n");
+
+		retry:
+			/* If the segment was cloned (e.g. a meta retransmission),
+			 * the header must be expanded/copied so that there is no
+			 * corruption of TSO information.
+			 */
+			if (skb_unclone(skb, GFP_ATOMIC))
+				goto exit;
+
+
+			old_factor = tcp_skb_pcount(skb);
+			tcp_set_skb_tso_segs(meta_sk, skb, mss_now);
+			tso_segs = tcp_skb_pcount(skb);
+
+			if (reinject == -1) {
+				/* The packet has already once been sent, so if we
+				 * change the pcount here we have to adjust packets_out
+				 * in the meta-sk
+			 	*/
+				int diff = old_factor - tso_segs;
+
+				if (diff)
+					tcp_adjust_pcount(meta_sk, skb, diff);
+
 			}
-			break;
-		}
 
-		if (tso_segs == 1) {
-			if (unlikely(!tcp_nagle_test(meta_tp, skb, mss_now,
+			cwnd_quota = tcp_cwnd_test(subtp, skb);
+			if (!cwnd_quota) {
+				/* May happen due to two cases:
+				 *
+				 * - if at the first selection we circumvented
+				 *   the test due to a DATA_FIN (and got rejected at
+				 *   tcp_snd_wnd_test), but the reinjected segment is not
+				 *   a DATA_FIN.
+				 * - if we take a DATA_FIN with data, but
+				 *   tcp_set_skb_tso_segs() increases the number of
+				 *   tso_segs to something > 1. Then, cwnd_test might
+				 *   reject it.
+			 	*/
+				mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+				continue;
+			}
+
+			if (!reinject && unlikely(!tcp_snd_wnd_test(meta_tp, skb, mss_now))) {
+				skb = mptcp_rcv_buf_optimization(subsk, 1);
+				if (skb) {
+					reinject = -1;
+					goto retry;
+				}
+				goto exit;
+			}
+
+			if (tso_segs == 1) {
+				if (unlikely(!tcp_nagle_test(meta_tp, skb, mss_now,
 						     (tcp_skb_is_last(meta_sk, skb) ?
 						      nonagle : TCP_NAGLE_PUSH))))
-				break;
-		} else {
-			/* Do not try to defer the transmission of a reinjected
-			 * segment. Send it directly.
-			 * If it is not possible to send the TSO segment on the
-			 * best subflow right now try to look for another subflow.
-			 * If there is no subflow available defer the segment to avoid
-			 * the call to mptso_fragment.
-			 */
-			if (!push_one && !reinject && tcp_tso_should_defer(subsk, skb)) {
-				mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
-				goto subflow;
+				goto exit;
+			} else {
+				/* Do not try to defer the transmission of a reinjected
+				 * segment. Send it directly.
+				 * If it is not possible to send the TSO segment on the
+				 * best subflow right now try to look for another subflow.
+				 * If there is no subflow available defer the segment to avoid
+				 * the call to mptso_fragment.
+				 */
+				if (!push_one && !reinject && tcp_tso_should_defer(subsk, skb)) {
+					mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+					if(sent_once)
+						continue;
+					else
+						goto subflow;
+				}
 			}
-		}
 
-		limit = mss_now;
-		if (tso_segs > 1 && !tcp_urg_mode(meta_tp))
-			limit = tcp_mss_split_point(subsk, skb, mss_now,
+			limit = mss_now;
+			if (tso_segs > 1 && !tcp_urg_mode(meta_tp))
+				limit = tcp_mss_split_point(subsk, skb, mss_now,
 						    min_t(unsigned int,
 							  cwnd_quota,
-							  subsk->sk_gso_max_segs),
-						    nonagle);
+							  subsk->sk_gso_max_segs),nonagle);
 
-		if (skb->len > limit &&
-		    unlikely(mptso_fragment(meta_sk, skb, limit, mss_now, gfp, reinject)))
-			break;
+			if (skb->len > limit &&
+			    unlikely(mptso_fragment(meta_sk, skb, limit, mss_now, gfp, reinject)))
+				goto exit;
 
-		subskb = mptcp_skb_entail(subsk, skb, reinject);
-		if (!subskb)
-			break;
+			subskb = mptcp_skb_entail(subsk, skb, reinject);
+			if (!subskb)
+				goto exit;
 
-		mpcb->noneligible = noneligible;
-		TCP_SKB_CB(skb)->when = tcp_time_stamp;
-		TCP_SKB_CB(subskb)->when = tcp_time_stamp;
-		if (unlikely(tcp_transmit_skb(subsk, subskb, 1, gfp))) {
-			mptcp_transmit_skb_failed(subsk, skb, subskb);
-			mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
-			continue;
-		}
+			mpcb->noneligible = noneligible;
+			TCP_SKB_CB(skb)->when = tcp_time_stamp;
+			TCP_SKB_CB(subskb)->when = tcp_time_stamp;
+			if (unlikely(tcp_transmit_skb(subsk, subskb, 1, gfp))) {
+				mptcp_transmit_skb_failed(subsk, skb, subskb);
+				mpcb->noneligible |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+				continue;
+			}
 
-		if (!reinject) {
-			mptcp_check_sndseq_wrap(meta_tp,
+			if (!reinject) {
+				mptcp_check_sndseq_wrap(meta_tp,
 						TCP_SKB_CB(skb)->end_seq -
 						TCP_SKB_CB(skb)->seq);
-			tcp_event_new_data_sent(meta_sk, skb);
+				tcp_event_new_data_sent(meta_sk, skb);
+			}
+
+			tcp_minshall_update(meta_tp, mss_now, skb);
+			sent_pkts += tcp_skb_pcount(skb);
+			tcp_sk(subsk)->mptcp->sent_pkts += tcp_skb_pcount(skb);
+
+			mptcp_sub_event_new_data_sent(subsk, subskb, skb);
+
+			if (reinject > 0) {
+				__skb_unlink(skb, &mpcb->reinject_queue);
+				kfree_skb(skb);
+			}
+			sent_once = true;
+
+
 		}
-
-		tcp_minshall_update(meta_tp, mss_now, skb);
-		sent_pkts += tcp_skb_pcount(skb);
-		tcp_sk(subsk)->mptcp->sent_pkts += tcp_skb_pcount(skb);
-
-		mptcp_sub_event_new_data_sent(subsk, subskb, skb);
-
-		if (reinject > 0) {
-			__skb_unlink(skb, &mpcb->reinject_queue);
-			kfree_skb(skb);
-		}
-
 		if (push_one)
-			break;
+                	goto exit;
+
 	}
+
+
+exit:
+	if(sent_pkts && sysctl_mptcp_retransmit_unacked == 1)
+		sent_pkts+=mptcp_opportunistic_retransmit_unacked(meta_sk, mss_now,
+			nonagle, gfp, stop_seq);
+
+	if(!push_one && sent_pkts && sysctl_mptcp_retransmit_unacked == 2)			
+			sent_pkts+=mptcp_opportunistic_retransmit_unacked2(meta_sk, mss_now,
+			nonagle, gfp, stop_seq);
+
+	if(!list_empty(&subflows))
+		mptcp_subflow_remove_all(&subflows);
 
 	mpcb->noneligible = 0;
 
@@ -1249,16 +1697,15 @@ retry:
 			if (subtp->mptcp->sent_pkts) {
 				if (tcp_in_cwnd_reduction(subsk))
 					subtp->prr_out += subtp->mptcp->sent_pkts;
-				tcp_cwnd_validate(subsk);
-				subtp->mptcp->sent_pkts = 0;
+					tcp_cwnd_validate(subsk);
+					subtp->mptcp->sent_pkts = 0;
+				}
 			}
-		}
 		return 0;
 	}
 
 	return !meta_tp->packets_out && tcp_send_head(meta_sk);
 }
-
 void mptcp_write_space(struct sock *sk)
 {
 	mptcp_push_pending_frames(mptcp_meta_sk(sk));
@@ -1898,7 +2345,11 @@ int mptcp_retransmit_skb(struct sock *meta_sk, struct sk_buff *skb)
 	struct sk_buff *subskb;
 	unsigned int limit, tso_segs, mss_now;
 	int err = -1, oldpcount;
-
+	struct list_head subflows;
+	struct list_head *p;
+        struct sock *sk;
+	struct mptcp_subflow *sf;
+	INIT_LIST_HEAD(&subflows);
 	/* Do not sent more than we queued. 1/4 is reserved for possible
 	 * copying overhead: fragmentation, tunneling, mangling etc.
 	 *
@@ -1912,70 +2363,93 @@ int mptcp_retransmit_skb(struct sock *meta_sk, struct sk_buff *skb)
 	/* We need to make sure that the retransmitted segment can be sent on a
 	 * subflow right now. If it is too big, it needs to be fragmented.
 	 */
-	subsk = get_available_subflow(meta_sk, skb, &mss_now);
-	if (!subsk) {
-		/* We want to increase icsk_retransmits, thus return 0, so that
-		 * mptcp_retransmit_timer enters the desired branch.
+
+	if(!sysctl_mptcp_optimize_retransmit) {
+		sk = get_available_subflow(meta_sk, skb, &mss_now);
+		if(!sk)
+		{
+			err = 0;
+			goto failed;			
+		}
+                sf = mptcp_subflow_alloc(sk, &mss_now);
+                if(sf == NULL) {
+                        err = -ENOMEM;
+                        goto failed;
+                }
+                list_add(&sf->list, &subflows);
+	}
+	else {
+
+		if(get_all_available_subflows(&subflows, meta_sk, skb, &mss_now)!=0)
+			goto failed;
+		if(list_empty(&subflows)) {
+			/* We want to increase icsk_retransmits, thus return 0, so that
+	                 * mptcp_retransmit_timer enters the desired branch.
+        	         */
+			err = 0;
+	                goto failed;
+		}
+	}
+
+	list_for_each(p, &subflows) {
+		sf = list_entry(p, struct mptcp_subflow, list);
+		subsk = sf->sk;
+		mss_now = *(sf->mss);
+		/* If the segment was cloned (e.g. a meta retransmission), the header
+		 * must be expanded/copied so that there is no corruption of TSO
+		 * information.
 		 */
-		err = 0;
-		goto failed;
-	}
+		if (skb_unclone(skb, GFP_ATOMIC)) {
+			err = -ENOMEM;
+			goto failed;
+		}
+		oldpcount = tcp_skb_pcount(skb);
+		tcp_set_skb_tso_segs(meta_sk, skb, mss_now);
+		tso_segs = tcp_skb_pcount(skb);
+		BUG_ON(!tso_segs);
 
-	/* If the segment was cloned (e.g. a meta retransmission), the header
-	 * must be expanded/copied so that there is no corruption of TSO
-	 * information.
-	 */
-	if (skb_unclone(skb, GFP_ATOMIC)) {
-		err = ENOMEM;
-		goto failed;
-	}
+		/* The MSS might have changed and so the number of segments. We
+		 * need to account for this change.
+	 	*/
+		if (unlikely(oldpcount != tso_segs))
+			tcp_adjust_pcount(meta_sk, skb, oldpcount - tso_segs);
 
-	oldpcount = tcp_skb_pcount(skb);
-	tcp_set_skb_tso_segs(meta_sk, skb, mss_now);
-	tso_segs = tcp_skb_pcount(skb);
-	BUG_ON(!tso_segs);
-
-	/* The MSS might have changed and so the number of segments. We
-	 * need to account for this change.
-	 */
-	if (unlikely(oldpcount != tso_segs))
-		tcp_adjust_pcount(meta_sk, skb, oldpcount - tso_segs);
-
-	limit = mss_now;
-	if (tso_segs > 1 && !tcp_urg_mode(meta_tp))
-		limit = tcp_mss_split_point(subsk, skb, mss_now,
+		limit = mss_now;
+		if (tso_segs > 1 && !tcp_urg_mode(meta_tp))
+			limit = tcp_mss_split_point(subsk, skb, mss_now,
 					    min_t(unsigned int,
 						  tcp_cwnd_test(tcp_sk(subsk), skb),
-						  subsk->sk_gso_max_segs),
-					          TCP_NAGLE_OFF);
+						  subsk->sk_gso_max_segs),TCP_NAGLE_OFF);
 
-	if (skb->len > limit &&
-	    unlikely(mptso_fragment(meta_sk, skb, limit, mss_now,
+		if (skb->len > limit &&
+		    unlikely(mptso_fragment(meta_sk, skb, limit, mss_now,
 				    GFP_ATOMIC, 0)))
-		goto failed;
+			goto failed;
 
-	subskb = mptcp_skb_entail(subsk, skb, -1);
-	if (!subskb)
-		goto failed;
+		subskb = mptcp_skb_entail(subsk, skb, -1);
+		if (!subskb)
+			goto failed;
 
-	TCP_SKB_CB(skb)->when = tcp_time_stamp;
-	TCP_SKB_CB(subskb)->when = tcp_time_stamp;
-	err = tcp_transmit_skb(subsk, subskb, 1, GFP_ATOMIC);
-	if (!err) {
-		/* Update global TCP statistics. */
-		TCP_INC_STATS(sock_net(meta_sk), TCP_MIB_RETRANSSEGS);
+		TCP_SKB_CB(skb)->when = tcp_time_stamp;
+		TCP_SKB_CB(subskb)->when = tcp_time_stamp;
+		err = tcp_transmit_skb(subsk, subskb, 1, GFP_ATOMIC);
+		if (!err) {
+			/* Update global TCP statistics. */
+			TCP_INC_STATS(sock_net(meta_sk), TCP_MIB_RETRANSSEGS);
 
-		/* Diff to tcp_retransmit_skb */
+			/* Diff to tcp_retransmit_skb */
 
-		/* Save stamp of the first retransmit. */
-		if (!meta_tp->retrans_stamp)
-			meta_tp->retrans_stamp = TCP_SKB_CB(subskb)->when;
-		mptcp_sub_event_new_data_sent(subsk, subskb, skb);
-	} else {
-		mptcp_transmit_skb_failed(subsk, skb, subskb);
+			/* Save stamp of the first retransmit. */
+			if (!meta_tp->retrans_stamp)
+				meta_tp->retrans_stamp = TCP_SKB_CB(subskb)->when;
+			mptcp_sub_event_new_data_sent(subsk, subskb, skb);
+		} else {
+			mptcp_transmit_skb_failed(subsk, skb, subskb);
+		}
 	}
 
 failed:
+	mptcp_subflow_remove_all(&subflows);
 	return err;
 }
 

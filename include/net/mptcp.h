@@ -58,6 +58,13 @@
 #define MPTCP_MAX_ADDR	8
 
 #define MPTCP_SUBFLOW_RETRY_DELAY	1000
+struct mptcp_subflow
+{
+	struct sock *sk;
+	unsigned int *mss;
+	struct list_head list;
+
+};
 
 struct mptcp_loc4 {
 	u8		loc4_id;
@@ -651,6 +658,12 @@ extern int sysctl_mptcp_enabled;
 extern int sysctl_mptcp_checksum;
 extern int sysctl_mptcp_debug;
 extern int sysctl_mptcp_syn_retries;
+extern int sysctl_mptcp_rbuf_opti;
+extern int sysctl_mptcp_rbuf_penal;
+extern int sysctl_mptcp_rbuf_retr;
+extern int sysctl_mptcp_retransmit_unacked;
+extern int sysctl_mptcp_optimize_transmit;
+extern int sysctl_mptcp_optimize_retransmit;
 
 extern struct workqueue_struct *mptcp_wq;
 
