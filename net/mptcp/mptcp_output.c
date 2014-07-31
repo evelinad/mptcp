@@ -254,14 +254,15 @@ static int get_all_available_subflows(struct list_head *subflows, struct sock *m
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct sock *sk;
 	int err = 0;
-	struct list_head lowpriosk_list;
-	struct list_head sk_list;
-	struct list_head backupsk_list;
+	//struct list_head lowpriosk_list;
+	//struct list_head sk_list;
+	//struct list_head backupsk_list;
 	struct mptcp_subflow *sf = NULL;
 	struct tcp_skb_cb *tcb = NULL;
-	INIT_LIST_HEAD(&lowpriosk_list);
-	INIT_LIST_HEAD(&sk_list);
-	INIT_LIST_HEAD(&backupsk_list);
+	struct list_head *p;
+	//INIT_LIST_HEAD(&lowpriosk_list);
+	//INIT_LIST_HEAD(&sk_list);
+	//INIT_LIST_HEAD(&backupsk_list);
 
 	if(!skb)
 		goto out;
@@ -302,66 +303,21 @@ static int get_all_available_subflows(struct list_head *subflows, struct sock *m
 
 	mptcp_for_each_sk(mpcb, sk) {
 		struct tcp_sock *tp = tcp_sk(sk);
-	        unsigned int *mss = 0;
-		if (!mptcp_is_available(sk, skb, mss))
-		{
-			//printk(KERN_ALERT "unavailable\n");
+	        unsigned int mss;
+		if (!mptcp_is_available(sk, skb, &mss))
                         continue;
-		}
-		//else printk(KERN_ALERT "edebine\n");
-                sf = mptcp_subflow_alloc(sk, mss);
+		if(mss_now)
+			*mss_now = mss;
+                sf = mptcp_subflow_alloc(sk, mss_now);
 		if(sf == NULL) {
                         err = -ENOMEM;
-			//printk(KERN_ALERT "naspa\n");
 			continue;
 		}
-                if (mptcp_dont_reinject_skb(tp, skb)) {
-                        list_add(&sf->list, &backupsk_list);
-                } 
-		else 
-		if (tp->mptcp->rcv_low_prio || tp->mptcp->low_prio) {
-                        list_add(&sf->list, &lowpriosk_list);
-		}
-		else
-                        list_add(&sf->list, &sk_list);
+		 list_add(&sf->list, subflows);
 
 
 	}
-        //printk(KERN_ALERT "empty %d %d %d\n", list_empty(&sk_list),list_empty(&backupsk_list),list_empty(&lowpriosk_list));
-
-	if(!list_empty(&sk_list)) {
-		subflows = &sk_list;
-		mptcp_subflow_remove_all(&backupsk_list);
-		mptcp_subflow_remove_all(&lowpriosk_list);
-		goto out;
-	}
-	if(!list_empty(&backupsk_list))
-	{
-		subflows = &backupsk_list;
-		if (skb)
-			TCP_SKB_CB(skb)->path_mask = 0;
-                mptcp_subflow_remove_all(&sk_list);
-                mptcp_subflow_remove_all(&lowpriosk_list);
-		goto out;
-	}
-	if(!list_empty(&lowpriosk_list))
-	{
-		subflows = &lowpriosk_list;
-                mptcp_subflow_remove_all(&backupsk_list);
-                mptcp_subflow_remove_all(&sk_list);
-		goto out;
-	}
-	out:
-		/*if(err != 0) {
-		        if(!list_empty(&lowpriosk_list))
-                		mptcp_subflow_remove_all(&lowpriosk_list);
-			if(!list_empty(&sk_list)) 
-                                mptcp_subflow_remove_all(&sk_list);
-			if(!list_empty(&backupsk_list)) 
-                        	mptcp_subflow_remove_all(&backupsk_list);
-
-		}*/
-		//printk(KERN_ALERT "empty %d\n", list_empty(subflows));
+out:
 		return err;
 
 }
@@ -1441,7 +1397,6 @@ int mptcp_opportunistic_retransmit_unacked(struct sock *meta_sk,
 exit:	
 	mpcb->noneligible=noneligible;
 
-//	printk(KERN_ALERT "gata!\n");
 	return sent_pkts;
 }
 
@@ -1506,30 +1461,6 @@ subflow:
 			get_all_available_subflows(&subflows, meta_sk, skb, &mss_now);
 			if(list_empty(&subflows))
 				goto exit;
-			/*{
-				printk(KERN_ALERT "de aici\n");
-				goto exit;
-			}*/
-			//printk(KERN_ALERT "empty2%d\n", list_empty(&subflows));
-			/*if(list_empty(&subflows)) {
-				//printk(KERN_ALERT "sau de aici\n");
-				subsk = get_available_subflow(meta_sk, skb, &mss_now);
-		                if(!subsk)
-				{
-					//printk(KERN_ALERT "e de oaie\n");
-                	                goto exit;
-				}
-                        	sf = mptcp_subflow_alloc(subsk, &mss_now);
-				if(sf == NULL) {
-		                        //printk(KERN_ALERT "nomem\n");
-                		        goto exit;
-                		}
-
-	                        list_add(&sf->list, &subflows);
-				//printk(KERN_ALERT "ba, totusi e ok\n");
-				//goto exit;
-			}*/
-			//else printk(KERN_ALERT "mama\n");
 		}
 		else {
 	                subsk = get_available_subflow(meta_sk, skb, &mss_now);
@@ -1539,19 +1470,16 @@ subflow:
                         list_add(&sf->list, &subflows);
 
 		}
-		//printk(KERN_ALERT "gogu\n");
    		/* Since all subsocks are locked before calling the scheduler,
                  * the tcp_send_head should not change.
                  */
 
                 BUG_ON(!reinject && tcp_send_head(meta_sk) != skb);
-
         	list_for_each(p, &subflows) {
                 	sf = list_entry(p, struct mptcp_subflow, list);
 			subsk = sf->sk;
 			subtp = tcp_sk(subsk);
 			mss_now = *(sf->mss);
-			//printk(KERN_ALERT "list\n");
 
 		retry:
 			/* If the segment was cloned (e.g. a meta retransmission),
@@ -2380,14 +2308,25 @@ int mptcp_retransmit_skb(struct sock *meta_sk, struct sk_buff *skb)
 	}
 	else {
 
-		if(get_all_available_subflows(&subflows, meta_sk, skb, &mss_now)!=0)
-			goto failed;
+		get_all_available_subflows(&subflows, meta_sk, skb, &mss_now);
 		if(list_empty(&subflows)) {
 			/* We want to increase icsk_retransmits, thus return 0, so that
 	                 * mptcp_retransmit_timer enters the desired branch.
         	         */
-			err = 0;
-	                goto failed;
+	                sk = get_available_subflow(meta_sk, skb, &mss_now);
+
+			if(!sk)
+			{
+				err = 0;
+				goto failed;			
+			}
+                	sf = mptcp_subflow_alloc(sk, &mss_now);
+	                if(sf == NULL) {
+        	                err = -ENOMEM;
+                	        goto failed;
+                	}
+
+                	list_add(&sf->list, &subflows);
 		}
 	}
 
